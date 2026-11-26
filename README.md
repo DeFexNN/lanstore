@@ -320,6 +320,8 @@ lanstore --agent agent-pc2 write askue/raw/notes.md --file notes.md
 lanstore --agent agent-pc2 cat askue/raw/points.csv --max 65536
 lanstore --agent agent-pc2 upload .\dump.csv askue/raw/dump.csv
 lanstore download askue/raw/dump.csv .\dump.csv
+lanstore --agent agent-pc2 trash
+lanstore --agent agent-pc2 restore <trashId> --overwrite
 lanstore --agent agent-pc2 activity
 ```
 
@@ -373,6 +375,9 @@ curl -s -X POST "$H/v1/uploads/up_ab12.../commit"
 | POST | `/v1/move` `{from, to, overwrite}` | перемістити/перейменувати |
 | POST | `/v1/copy` `{from, to, overwrite}` | копіювати (теки — рекурсивно) |
 | POST/DELETE | `/v1/delete` `{path, recursive, permanent}` | у кошик або остаточно |
+| GET | `/v1/trash?limit=` | що лежить у кошику (trashId, шлях, тип, розмір, час) |
+| POST | `/v1/restore` `{trashId, to?, overwrite?}` | відновити з кошика |
+| POST | `/v1/trash` `{olderThanDays?\|all?}` | очистити кошик (за віком або повністю) |
 | GET | `/v1/read?path=&offset=&maxBytes=` | текстовий фрагмент + `version`, `nextOffset` |
 | GET | `/v1/search?path=&name=&content=&max=` | пошук за іменем/вмістом |
 | GET | `/v1/usage?path=` | розмір теки |
@@ -407,13 +412,19 @@ curl -s -X POST "$H/v1/uploads/up_ab12.../commit"
 | `fs_usage` | розмір теки |
 | `fs_transfer` | готові команди curl/PowerShell для великих файлів |
 | `fs_activity` | хто що писав останнім часом |
+| `fs_trash_list` | кошик: що видалено, коли і ким |
+| `fs_restore` | відновити елемент за `trashId` (overwrite-safe: стара версія теж іде в кошик) |
+| `fs_empty_trash` | очистити кошик за віком або повністю |
 
-Міст для Linux/macOS (`lanstore-bridge`) додає ще два локальні інструменти:
+Міст для Linux/macOS (`lanstore-bridge`) додає локальні інструменти:
 
 | Інструмент | Що робить |
 |---|---|
 | `hub_status` | до якого хаба підключено, як адресу знайдено, стан черги |
 | `hub_rediscover` | примусово перешукати хаб (опційно закріпити `url`) |
+| `fs_upload_local` | залити файл із локального диска на хаб через resumable-сесію, без base64 |
+| `fs_commit_upload` | зафіксувати сесію після конфлікту, не передаючи файл заново |
+| `fs_download_local` | скачати файл із хаба на локальний диск потоком (`overwrite`, `resume`) |
 
 Інструкція в `initialize` прямо пояснює моделі контракт `RECENTLY_MODIFIED → перечитати → повторити`,
 тому агент не сприймає 409 як фатальну помилку.
@@ -439,7 +450,8 @@ curl -s -X POST "$H/v1/uploads/up_ab12.../commit"
   "maxInlineWriteBytes": 33554432,
   "trash": { "enabled": true, "retentionDays": 30 },
   "uploads": { "chunkHint": 8388608 },
-  "audit": { "enabled": true },
+  "minFreeBytes": 536870912,
+  "audit": { "enabled": true, "maxBytes": 33554432, "backups": 3 },
   "discovery": { "enabled": true, "port": 8788 },
   "auth": {
     "enabled": true,
@@ -491,9 +503,14 @@ node -e "console.log(require('node:crypto').randomBytes(24).toString('base64url'
 ## 9. Обслуговування
 
 - **Журнал**: `logs/audit.jsonl` (JSONL: час, агент, операція, шлях, код, розмір, версія, IP).
-  Читається через `GET /v1/activity`, ротацію робіть вручну або зовнішнім лог-менеджером.
-- **Кошик**: `<root>/.lanstore/trash/<timestamp>/<початковий шлях>`. Відновлення — перемістити файл
-  назад у сховище (наприклад, через провідник хаба). Автоочищення — `trash.retentionDays` (30 днів).
+  Авторотація: після `audit.maxBytes` (32 МБ) файл стає `.1`, тримається `audit.backups` копій.
+  Читається через `GET /v1/activity`.
+- **Кошик**: `/v1/trash` показує видалене, `/v1/restore` повертає назад. У CLI:
+  `lanstore trash` та `lanstore restore <trashId> [--to path] [--overwrite]`. Фізично —
+  `<root>/.lanstore/trash/<id>/` з `meta.json` (хто/коли/що). Автоочищення —
+  `trash.retentionDays` (30 днів), вручну — `POST /v1/trash {"all":true}`.
+- **Місце на диску**: якщо вільно менше `minFreeBytes` (512 МБ) + розмір запису, хаб
+  відповідає `507 insufficient_storage` і нічого не пише.
 - **Сесії завантажень**: `<root>/.lanstore/uploads/<id>/`, незавершені старші за 7 днів
   видаляються при старті.
 - **Резервні копії**: робіть бекап каталогу `data/` (`.lanstore` можна виключити, крім випадків,
@@ -509,10 +526,10 @@ node -e "console.log(require('node:crypto').randomBytes(24).toString('base64url'
 node --test
 ```
 
-48 тестів: юніти черги (блок/повтор/чужий агент/власний запис/застаріла версія); інтеграційні —
-MCP handshake і tools, конфліктний цикл, Range/HEAD/304, resumable upload, захист шляхів, токени,
-дашборд; автопошук (UDP-маяк, кеш, кілька кандидатів) і stdio-міст; інсталятор (команди для
-opencode/Codex/Claude, YAML-блок dsh, ідемпотентність, dry-run).
+55 тестів: юніти черги (блок/повтор/чужий агент/власний запис/застаріла версія); інтеграційні —
+MCP handshake і tools, конфліктний цикл, Range/HEAD/304, resumable upload (стрімінг частин),
+захист шляхів, токени, дашборд, кошик/відновлення, ліміт вільного місця; автопошук (UDP-маяк, кеш,
+кілька кандидатів), stdio-міст (upload/download локальних файлів), ротація журналу та інсталятор.
 
 ---
 

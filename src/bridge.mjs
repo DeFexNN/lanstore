@@ -15,6 +15,11 @@
  * retried once, so a DHCP lease change does not break the agent.
  */
 import readline from 'node:readline';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 import { APP_VERSION } from './util.mjs';
 import { discoverHub, cachePath, verifyHub } from './discover.mjs';
@@ -40,6 +45,54 @@ const LOCAL_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: { url: { type: 'string', description: 'http://host:port — закріпити вручну (необов’язково).' } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'fs_upload_local',
+    description:
+      'Завантажити файл із ЦІЄЇ машини на хаб через resumable-сесію (будь-який розмір, без base64). ' +
+      'Якщо файл на хабі щойно змінив інший агент, повертається конфлікт із новим вмістом та uploadId: ' +
+      'прочитайте вміст і викличте fs_commit_upload, щоб не передавати файл заново. Повторний виклик з uploadId докачує з nextOffset.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        localPath: { type: 'string', description: 'Шлях до файлу на цій машині.' },
+        remotePath: { type: 'string', description: 'Шлях на хабі. Якщо закінчується на "/" — додається ім’я файлу.' },
+        mode: { type: 'string', enum: ['overwrite', 'create'] },
+        expectedVersion: { type: 'string' },
+        uploadId: { type: 'string', description: 'Продовжити наявну сесію (з nextOffset).' }
+      },
+      required: ['localPath'],
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'fs_commit_upload',
+    description: 'Зафіксувати upload-сесію, створену fs_upload_local, після ознайомлення з конфліктом. Файл заново не передається.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        uploadId: { type: 'string' },
+        expectedVersion: { type: 'string' }
+      },
+      required: ['uploadId'],
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'fs_download_local',
+    description:
+      'Скачати файл із хаба на ЦЮ машину потоком. overwrite=true перезаписує локальний файл, resume=true докачує частково завантажений через Range.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        remotePath: { type: 'string' },
+        localPath: { type: 'string', description: 'Куди зберегти (типово — ім’я файлу в поточній теці).' },
+        overwrite: { type: 'boolean' },
+        resume: { type: 'boolean' }
+      },
+      required: ['remotePath'],
       additionalProperties: false
     }
   }
@@ -131,6 +184,189 @@ async function rpc(method, params, { retry = true } = {}) {
   }
 }
 
+/** Direct HTTP to the hub (files, upload sessions) with one rediscovery retry. */
+async function hubRequest(pathname, { method = 'GET', headers = {}, body = null, retry = true } = {}) {
+  let target;
+  try {
+    target = await ensureHub();
+  } catch (err) {
+    throw new HubUnavailable(err.message);
+  }
+
+  const doFetch = async (t) => {
+    const res = await fetch(`${t.url}${pathname}`, {
+      method,
+      headers: {
+        ...(body !== null ? { 'Content-Type': 'application/json' } : {}),
+        ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+        ...(AGENT ? { 'X-Agent-Id': AGENT } : {}),
+        ...headers
+      },
+      body:
+        body === null
+          ? undefined
+          : typeof body === 'string' || body instanceof Uint8Array
+            ? body
+            : JSON.stringify(body),
+      signal: AbortSignal.timeout(RPC_TIMEOUT_MS)
+    });
+    if (res.status === 401) {
+      throw new HubUnavailable('хаб відхилив токен (401). Задайте LANSTORE_TOKEN у конфігу MCP.');
+    }
+    return res;
+  };
+
+  try {
+    return await doFetch(target);
+  } catch (err) {
+    if (retry && isNetworkError(err)) {
+      log(`hub ${target.url} unreachable (${err.message}); rediscovering`);
+      hub = null;
+      const fresh = await ensureHub({ force: true });
+      return doFetch(fresh);
+    }
+    throw err;
+  }
+}
+
+async function hubJson(pathname, options = {}) {
+  const res = await hubRequest(pathname, options);
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: res.ok, status: res.status, message: text.slice(0, 500) };
+  }
+}
+
+async function uploadLocal(args) {
+  const localPath = path.resolve(String(args.localPath || ''));
+  const stat = await fsp.stat(localPath).catch(() => null);
+  if (!stat || !stat.isFile()) throw new Error(`not a file: ${localPath}`);
+
+  let remote = String(args.remotePath || path.basename(localPath));
+  if (remote.endsWith('/')) remote += path.basename(localPath);
+
+  let uploadId = args.uploadId ? String(args.uploadId) : null;
+  let offset = 0;
+  let chunkSize = 8 * 1024 * 1024;
+
+  if (uploadId) {
+    const meta = await hubJson(`/v1/uploads/${uploadId}`);
+    if (meta.ok === false) return textResult(meta);
+    offset = Number(meta.nextOffset) || 0;
+    remote = meta.path || remote;
+  } else {
+    const begin = await hubJson('/v1/uploads', {
+      method: 'POST',
+      body: {
+        path: remote,
+        totalBytes: stat.size,
+        mode: args.mode || 'overwrite',
+        expectedVersion: args.expectedVersion || null
+      }
+    });
+    if (begin.ok === false) {
+      begin.hint = 'Ознайомтеся з content вище і повторіть fs_upload_local (можна з expectedVersion = version).';
+      return textResult(begin);
+    }
+    uploadId = begin.uploadId;
+    offset = Number(begin.nextOffset) || 0;
+    chunkSize = Number(begin.chunkHint) || chunkSize;
+  }
+
+  const fh = await fsp.open(localPath, 'r');
+  try {
+    const buffer = Buffer.alloc(chunkSize);
+    while (offset < stat.size) {
+      const { bytesRead } = await fh.read(buffer, 0, Math.min(chunkSize, stat.size - offset), offset);
+      if (!bytesRead) break;
+      const res = await hubRequest(`/v1/uploads/${uploadId}?offset=${offset}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: buffer.subarray(0, bytesRead)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return textResult({
+          ...data,
+          uploadId,
+          hint: 'Повторіть fs_upload_local з цим uploadId, щоб докачати з nextOffset.'
+        });
+      }
+      offset = Number(data.nextOffset) || offset + bytesRead;
+    }
+  } finally {
+    await fh.close();
+  }
+
+  const commit = await hubJson(`/v1/uploads/${uploadId}/commit`, {
+    method: 'POST',
+    body: { expectedVersion: args.expectedVersion || null }
+  });
+  if (commit.ok === false) {
+    commit.uploadId = uploadId;
+    commit.localPath = localPath;
+    commit.hint = 'Прочитайте content і викличте fs_commit_upload з цим uploadId (файл уже на хабі).';
+  } else {
+    commit.localPath = localPath;
+    commit.remotePath = commit.path || remote;
+  }
+  return textResult(commit);
+}
+
+async function commitUpload(args) {
+  const uploadId = String(args.uploadId || '');
+  if (!/^up_[a-f0-9]{18}$/.test(uploadId)) throw new Error('invalid uploadId (expected up_<hex>)');
+  const result = await hubJson(`/v1/uploads/${uploadId}/commit`, {
+    method: 'POST',
+    body: { expectedVersion: args.expectedVersion || null }
+  });
+  return textResult(result);
+}
+
+async function downloadLocal(args) {
+  const remote = String(args.remotePath || '');
+  if (!remote) throw new Error('remotePath is required');
+  const localPath = path.resolve(String(args.localPath || path.basename(remote)));
+  const overwrite = args.overwrite === true;
+  const resume = args.resume === true;
+
+  let start = 0;
+  try {
+    const existing = await fsp.stat(localPath);
+    if (existing.isFile()) {
+      if (!overwrite && !resume) {
+        throw new Error(`local file exists: ${localPath} (pass overwrite=true or resume=true)`);
+      }
+      if (resume) start = existing.size;
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+
+  const headers = start > 0 ? { Range: `bytes=${start}-` } : {};
+  const res = await hubRequest(`/v1/file?path=${encodeURIComponent(remote)}`, { headers });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({ ok: false, code: `HTTP_${res.status}`, message: `HTTP ${res.status}` }));
+    return textResult(data);
+  }
+  if (start > 0 && res.status !== 206) start = 0;
+
+  await fsp.mkdir(path.dirname(localPath), { recursive: true });
+  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(localPath, { flags: start > 0 ? 'a' : 'w' }));
+  const st = await fsp.stat(localPath);
+  return textResult({
+    ok: true,
+    action: 'downloaded',
+    remotePath: remote,
+    localPath,
+    bytes: st.size,
+    resumedFrom: start || null
+  });
+}
+
+
 function textResult(value) {
   return { content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }], isError: false };
 }
@@ -190,6 +426,28 @@ async function hubStatus() {
 
 async function callTool({ name, arguments: args }) {
   if (name === 'hub_status') return textResult(await hubStatus());
+
+  if (name === 'fs_upload_local') {
+    try {
+      return await uploadLocal(args || {});
+    } catch (err) {
+      return errorResult(err);
+    }
+  }
+  if (name === 'fs_commit_upload') {
+    try {
+      return await commitUpload(args || {});
+    } catch (err) {
+      return errorResult(err);
+    }
+  }
+  if (name === 'fs_download_local') {
+    try {
+      return await downloadLocal(args || {});
+    } catch (err) {
+      return errorResult(err);
+    }
+  }
 
   if (name === 'hub_rediscover') {
     hub = null;

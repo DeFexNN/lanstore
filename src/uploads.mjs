@@ -1,5 +1,8 @@
 import fsp from 'node:fs/promises';
+import fs from 'node:fs';
 import path from 'node:path';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 import { HubError, randomId } from './util.mjs';
 
@@ -99,6 +102,7 @@ export class Uploads {
     if (meta.totalBytes !== null && (!Number.isFinite(meta.totalBytes) || meta.totalBytes < 0)) {
       throw new HubError('bad_request', 'totalBytes must be a non-negative number', 400);
     }
+    await this.store.checkFreeSpace(meta.totalBytes || 0);
 
     await fsp.mkdir(path.join(this.dir, id), { recursive: true });
     await fsp.writeFile(path.join(this.dir, id, 'part'), Buffer.alloc(0));
@@ -114,7 +118,8 @@ export class Uploads {
     };
   }
 
-  async chunk(id, { offset = 0, buffer, agentId = 'anonymous' } = {}) {
+  /** Stream one chunk straight to disk; nothing is buffered in memory. */
+  async chunkStream(id, { offset = 0, req, agentId = 'anonymous' } = {}) {
     const meta = await this.get(id);
     if (!meta) throw new HubError('upload_not_found', `unknown upload id: ${id}`, 404);
     if (meta.createdBy && meta.createdBy !== 'anonymous' && meta.createdBy !== agentId) {
@@ -126,13 +131,35 @@ export class Uploads {
         nextOffset: meta.received
       });
     }
-    if (!buffer?.length) throw new HubError('bad_request', 'empty chunk', 400);
-    if (meta.totalBytes !== null && meta.received + buffer.length > meta.totalBytes) {
+
+    const partPath = path.join(this.dir, id, 'part');
+    const before = meta.received;
+    const declared = Number(req.headers['content-length']);
+    if (meta.totalBytes !== null && Number.isFinite(declared) && before + declared > meta.totalBytes) {
       throw new HubError('too_large', `chunk exceeds declared totalBytes (${meta.totalBytes})`, 409, { uploadId: id });
     }
 
-    await fsp.appendFile(path.join(this.dir, id, 'part'), buffer);
-    meta.received += buffer.length;
+    let written = 0;
+    const counter = new Transform({
+      transform(chunk, _enc, cb) {
+        written += chunk.length;
+        if (meta.totalBytes !== null && before + written > meta.totalBytes) {
+          cb(new HubError('too_large', `chunk exceeds declared totalBytes (${meta.totalBytes})`, 409, { uploadId: id }));
+          return;
+        }
+        cb(null, chunk);
+      }
+    });
+
+    try {
+      await pipeline(req, counter, fs.createWriteStream(partPath, { flags: 'a' }));
+    } catch (err) {
+      await fsp.truncate(partPath, before).catch(() => {});
+      throw err;
+    }
+    if (!written) throw new HubError('bad_request', 'empty chunk', 400);
+
+    meta.received = before + written;
     await this._save(meta);
     return { ok: true, code: 'OK', action: 'chunk_received', ...this._public(meta) };
   }
@@ -165,6 +192,12 @@ export class Uploads {
       await this.drop(id);
       return result;
     }
+
+    // A blocked commit already issued a read-before-write challenge for the current
+    // version. Drop the stale expectedVersion so the next commit can use that challenge
+    // instead of failing on an expectedVersion mismatch again.
+    meta.expectedVersion = null;
+    await this._save(meta).catch(() => {});
 
     result.uploadId = id;
     result.retry = { ...(result.retry || {}), commit: true, uploadId: id };

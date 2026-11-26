@@ -18,6 +18,7 @@
     "chunkHint": 8388608,
     "ttlMs": 604800000
   },
+  "minFreeBytes": 536870912,
   "audit": {
     "enabled": true
   },

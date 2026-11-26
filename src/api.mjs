@@ -3,9 +3,8 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 
 import { HubError, APP_VERSION, formatAgo } from './util.mjs';
-import { sendJson, readJson, readBody, writeReqToFile, headerValue } from './http.mjs';
+import { sendJson, readJson, writeReqToFile, headerValue } from './http.mjs';
 
-const MAX_CHUNK_BYTES = 512 * 1024 * 1024;
 const UPLOAD_RE = /^\/v1\/uploads\/(up_[a-f0-9]{18})(\/commit)?$/;
 
 function reply(res, result, extraHeaders = null) {
@@ -176,6 +175,35 @@ export function createApi({ store, uploads, cfg, audit, guard, startedAt, identi
       return reply(res, result);
     }
 
+    if (pathname === '/v1/trash') {
+      if (method === 'GET') {
+        return sendJson(res, 200, await store.listTrash({ limit: asInt(q.get('limit'), 200) }));
+      }
+      if (method === 'POST') {
+        const body = await readJson(req, cfg.maxJsonBodyBytes);
+        const result = await store.emptyTrash({
+          all: body.all === true,
+          olderThanDays: body.olderThanDays ?? 0,
+          agentId: agent.id,
+          ip: agent.ip
+        });
+        return sendJson(res, 200, result);
+      }
+      throw new HubError('method_not_allowed', 'use GET /v1/trash or POST /v1/trash {all|olderThanDays}', 405);
+    }
+
+    if (pathname === '/v1/restore') {
+      if (method !== 'POST') throw new HubError('method_not_allowed', 'use POST', 405);
+      const body = await readJson(req, cfg.maxJsonBodyBytes);
+      const result = await store.restore(body.trashId, {
+        to: body.to || null,
+        overwrite: body.overwrite === true,
+        agentId: agent.id,
+        ip: agent.ip
+      });
+      return sendJson(res, 200, result);
+    }
+
     if (pathname === '/v1/read') {
       const result = await store.readText(q.get('path') || '', {
         offset: asInt(q.get('offset'), 0),
@@ -267,8 +295,7 @@ export function createApi({ store, uploads, cfg, audit, guard, startedAt, identi
 
       if (!isCommit && method === 'PUT') {
         const offset = asInt(headerValue(req, 'x-offset') ?? q.get('offset'), 0);
-        const buffer = await readBody(req, MAX_CHUNK_BYTES);
-        const result = await uploads.chunk(id, { offset, buffer, agentId: agent.id });
+        const result = await uploads.chunkStream(id, { offset, req, agentId: agent.id });
         return sendJson(res, 200, result);
       }
 

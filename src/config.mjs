@@ -68,12 +68,17 @@ export function defaults(appDir = APP_DIR) {
     searchMaxFileBytes: 2 * 1024 * 1024,
     fsync: false,
 
+    // Refuse writes when the storage volume is nearly full.
+    minFreeBytes: 512 * 1024 * 1024,
+
     trash: { enabled: true, retentionDays: 30 },
 
     audit: {
       enabled: true,
       file: path.join(appDir, 'logs', 'audit.jsonl'),
-      tailBytes: 512 * 1024
+      tailBytes: 512 * 1024,
+      maxBytes: 32 * 1024 * 1024,
+      backups: 3
     },
 
     auth: {

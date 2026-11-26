@@ -338,8 +338,7 @@ export class Store {
     };
   }
 
-  async buildConflict(rel, abs, st, version, { code, agentId = null, ageMs = null, lastAgent = null, expectedVersion = null, op = 'write' } = {}) {
-    const preview = await this.readPreview(rel, abs, st);
+  async buildConflict(rel, abs, st, version, { code, agentId = null, ageMs = null, lastAgent = null, expectedVersion = null, op = 'write' } = {}) {    const preview = await this.readPreview(rel, abs, st);
     const isRecent = (code || 'RECENTLY_MODIFIED') === 'RECENTLY_MODIFIED';
     const ago = ageMs !== null ? formatAgo(ageMs) : null;
 
@@ -418,6 +417,29 @@ export class Store {
    * Move a fully prepared temp file into place, applying the write guard.
    * Rejected writes return a conflict object (ok:false) instead of throwing.
    */
+  async _freeBytes() {
+    const now = Date.now();
+    if (this._freeCache && now - this._freeCache.at < 5000) return this._freeCache.free;
+    const info = await this.diskInfo();
+    const free = info ? info.freeBytes : null;
+    this._freeCache = { at: now, free };
+    return free;
+  }
+
+  async checkFreeSpace(bytes = 0) {
+    const free = await this._freeBytes();
+    const minFree = Number(this.cfg.minFreeBytes) || 0;
+    if (minFree > 0 && free !== null && free < minFree + bytes) {
+      throw new HubError(
+        'insufficient_storage',
+        `not enough free space: ${humanBytes(free)} left, need ${humanBytes(bytes)} + ${humanBytes(minFree)} spare`,
+        507,
+        { freeBytes: free, minFreeBytes: minFree, neededBytes: bytes }
+      );
+    }
+    return free;
+  }
+
   async commitTemp(rel, tmpAbs, { agentId = 'anonymous', mode = 'overwrite', expectedVersion = null, createParents = true, bytes = null, op = 'write', keepTempOnReject = false, ip = null } = {}) {
     const norm = normalizeRel(rel, { allowRoot: false });
     const abs = await this.absOf(norm);
@@ -471,6 +493,13 @@ export class Store {
         });
         await this.audit.log({ agent: agentId, op, path: norm, ok: false, code: decision.code, bytes, ip });
         return conflict;
+      }
+
+      try {
+        await this.checkFreeSpace(bytes || 0);
+      } catch (err) {
+        if (!keepTempOnReject) await fsp.rm(tmpAbs, { force: true }).catch(() => {});
+        throw err;
       }
 
       let written = bytes;
@@ -674,10 +703,7 @@ export class Store {
     const useTrash = !permanent && this.cfg.trash?.enabled !== false;
     let trashId = null;
     if (useTrash) {
-      trashId = new Date().toISOString().replace(/[:.]/g, '-');
-      const target = path.join(this.trashDir, trashId, ...norm.split('/'));
-      await fsp.mkdir(path.dirname(target), { recursive: true });
-      await renameWithRetry(abs, target);
+      trashId = await this._moveToTrash(abs, norm, agentId);
     } else {
       await fsp.rm(abs, { recursive: true, force: false });
     }
@@ -693,6 +719,189 @@ export class Store {
       size: st.size,
       trashId
     };
+  }
+
+  /** Move a path into the hub trash and record what it was, so restore is exact. */
+  async _moveToTrash(abs, rel, agentId = 'anonymous') {
+    const batch = `${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(2).toString('hex')}`;
+    const batchAbs = path.join(this.trashDir, batch);
+    await fsp.mkdir(batchAbs, { recursive: true });
+    await fsp
+      .writeFile(
+        path.join(batchAbs, 'meta.json'),
+        JSON.stringify({ path: rel, deletedAt: new Date().toISOString(), agent: agentId }, null, 2)
+      )
+      .catch(() => {});
+    const target = path.join(batchAbs, ...rel.split('/'));
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await renameWithRetry(abs, target);
+    return batch;
+  }
+
+  async listTrash({ limit = 200 } = {}) {
+    const maxBatches = Math.max(1, Math.min(Number(limit) || 200, 1000));
+    let dirents = [];
+    try {
+      dirents = await fsp.readdir(this.trashDir, { withFileTypes: true });
+    } catch {
+      return { ok: true, count: 0, total: 0, batches: [] };
+    }
+
+    const batches = [];
+    for (const dirent of dirents) {
+      if (!dirent.isDirectory()) continue;
+      const batchAbs = path.join(this.trashDir, dirent.name);
+      let bst;
+      try {
+        bst = await fsp.stat(batchAbs);
+      } catch {
+        continue;
+      }
+      let meta = null;
+      try {
+        meta = JSON.parse(await fsp.readFile(path.join(batchAbs, 'meta.json'), 'utf8'));
+      } catch {
+        /* legacy batch without metadata */
+      }
+      let top = [];
+      try {
+        top = (await fsp.readdir(batchAbs)).filter((name) => name !== 'meta.json');
+      } catch {
+        continue;
+      }
+      let entryRel = meta?.path || (top.length === 1 ? top[0] : null);
+      let type = 'file';
+      let size = 0;
+      if (entryRel) {
+        const entryAbs = path.join(batchAbs, ...String(entryRel).split('/'));
+        try {
+          const st = await fsp.stat(entryAbs);
+          type = st.isDirectory() ? 'dir' : 'file';
+          size = st.size;
+        } catch {
+          if (meta?.path) entryRel = top.length === 1 ? top[0] : top.join(', ');
+        }
+      } else {
+        entryRel = top.join(', ');
+      }
+      batches.push({
+        trashId: dirent.name,
+        path: entryRel,
+        type,
+        size,
+        deletedAt: meta?.deletedAt || new Date(bst.mtimeMs).toISOString(),
+        deletedBy: meta?.agent || null
+      });
+    }
+
+    batches.sort((a, b) => String(b.deletedAt).localeCompare(String(a.deletedAt)));
+    return { ok: true, count: batches.length, total: batches.length, batches: batches.slice(0, maxBatches) };
+  }
+
+  /**
+   * Restore a trashed item. When the destination exists, overwrite=true first moves
+   * the current version into the trash (so the restore itself is undoable).
+   */
+  async restore(trashId, { to = null, overwrite = false, agentId = 'anonymous', ip = null } = {}) {
+    const id = String(trashId || '');
+    if (!/^[A-Za-z0-9._-]{1,80}$/.test(id)) throw new HubError('bad_trash_id', 'invalid trash id', 400);
+
+    const batchAbs = path.join(this.trashDir, id);
+    let bst;
+    try {
+      bst = await fsp.stat(batchAbs);
+    } catch {
+      throw new HubError('not_found', `trash item not found: ${id}`, 404);
+    }
+    if (!bst.isDirectory()) throw new HubError('bad_trash_id', 'trash item is not a directory', 400);
+
+    let meta = null;
+    try {
+      meta = JSON.parse(await fsp.readFile(path.join(batchAbs, 'meta.json'), 'utf8'));
+    } catch {
+      /* legacy */
+    }
+    const top = (await fsp.readdir(batchAbs)).filter((name) => name !== 'meta.json');
+    if (!meta?.path && top.length !== 1) {
+      throw new HubError('bad_trash_id', 'cannot determine what to restore (legacy multi-item trash batch)', 409);
+    }
+    const sourceRel = normalizeRel(meta?.path || top[0] || '', { allowRoot: false });
+    if (!sourceRel) throw new HubError('bad_trash_id', 'trash item is empty', 400);
+
+    const targetRel = to ? normalizeRel(to, { allowRoot: false }) : sourceRel;
+    const srcAbs = resolveInside(batchAbs, sourceRel);
+    try {
+      await fsp.lstat(srcAbs);
+    } catch {
+      throw new HubError('not_found', `trashed content is missing: ${sourceRel}`, 404);
+    }
+
+    const destAbs = await this.absOf(targetRel);
+    await fsp.mkdir(path.dirname(destAbs), { recursive: true });
+
+    let overwrittenBatch = null;
+    try {
+      const existing = await fsp.lstat(destAbs);
+      if (existing) {
+        if (!overwrite) {
+          throw new HubError('already_exists', `restore target already exists: ${targetRel} (use overwrite=true)`, 409, {
+            trashId: id,
+            path: sourceRel
+          });
+        }
+        overwrittenBatch = await this._moveToTrash(destAbs, targetRel, agentId);
+      }
+    } catch (err) {
+      if (err instanceof HubError) throw err;
+      if (err.code !== 'ENOENT') throw err;
+    }
+
+    await renameWithRetry(srcAbs, destAbs);
+    await fsp.rm(batchAbs, { recursive: true, force: true }).catch(() => {});
+    this.guard.forget(targetRel);
+    await this.audit.log({ agent: agentId, op: 'restore', path: targetRel, from: `trash/${id}`, ok: true, code: 'OK', ip });
+
+    return {
+      ok: true,
+      code: 'OK',
+      action: 'restored',
+      trashId: id,
+      path: sourceRel,
+      to: targetRel,
+      overwrittenBatch
+    };
+  }
+
+  async emptyTrash({ olderThanDays = 30, all = false, agentId = 'anonymous', ip = null } = {}) {
+    const days = Number(olderThanDays);
+    if (!all && (!Number.isFinite(days) || days <= 0)) {
+      throw new HubError('bad_request', 'set all=true to empty the whole trash, or olderThanDays > 0', 400);
+    }
+    const cutoff = all ? Infinity : Date.now() - days * 86_400_000;
+    let dirents = [];
+    try {
+      dirents = await fsp.readdir(this.trashDir, { withFileTypes: true });
+    } catch {
+      return { ok: true, action: 'trash_emptied', removed: 0 };
+    }
+
+    let removed = 0;
+    for (const dirent of dirents) {
+      if (!dirent.isDirectory()) continue;
+      const batchAbs = path.join(this.trashDir, dirent.name);
+      let st;
+      try {
+        st = await fsp.stat(batchAbs);
+      } catch {
+        continue;
+      }
+      if (st.mtimeMs <= cutoff) {
+        await fsp.rm(batchAbs, { recursive: true, force: true }).catch(() => {});
+        removed++;
+      }
+    }
+    await this.audit.log({ agent: agentId, op: 'trash_empty', path: '.lanstore/trash', ok: true, code: 'OK', removed, ip });
+    return { ok: true, action: 'trash_emptied', removed, olderThanDays: all ? 'all' : days };
   }
 
   async openRead(rel, rangeHeader = null) {

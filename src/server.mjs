@@ -65,7 +65,7 @@ export async function createHub({ argv = [], overrides = {} } = {}) {
 
       if (url.pathname === '/' || url.pathname === '/index.html') {
         const agent = auth.identify(req, url);
-        const html = await renderDashboard({ store, cfg, audit, uploads, req, agent });
+        const html = await renderDashboard({ store, cfg, audit, uploads, req, url, agent });
         return sendText(res, 200, html, 'text/html; charset=utf-8');
       }
 

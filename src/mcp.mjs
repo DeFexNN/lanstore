@@ -146,7 +146,7 @@ const TOOLS = [
   },
   {
     name: 'fs_delete',
-    description: 'Delete a file or directory. By default the item is moved to the hub trash (.lanstore/trash) and can be recovered manually; permanent=true removes it for real. Non-empty directories require recursive=true.',
+    description: 'Delete a file or directory. By default the item is moved to the hub trash (.lanstore/trash) and can be restored with fs_restore; permanent=true removes it for real. Non-empty directories require recursive=true.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -155,6 +155,42 @@ const TOOLS = [
         permanent: { type: 'boolean' }
       },
       required: ['path'],
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'fs_trash_list',
+    description: 'List recently deleted items in the hub trash: trashId, original path, type, size and deletion time. Use fs_restore with the trashId to bring an item back.',
+    inputSchema: {
+      type: 'object',
+      properties: { limit: { type: 'integer', description: 'Max batches to return (default 200).' } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'fs_restore',
+    description:
+      'Restore an item from the hub trash by trashId (from fs_trash_list). If the destination already exists, pass overwrite=true — the current version is first moved to the trash, so the restore itself stays undoable.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        trashId: { type: 'string' },
+        to: { type: 'string', description: 'Restore under a different path (optional).' },
+        overwrite: { type: 'boolean' }
+      },
+      required: ['trashId'],
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'fs_empty_trash',
+    description: 'Permanently remove trashed items. Default: older than 30 days. all=true empties the whole trash.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        olderThanDays: { type: 'integer' },
+        all: { type: 'boolean' }
+      },
       additionalProperties: false
     }
   },
@@ -319,6 +355,25 @@ export function createMcp({ store, uploads, cfg, audit, startedAt }) {
           agentId: agent.id,
           recursive: a.recursive === true,
           permanent: a.permanent === true,
+          ip: agent.ip
+        });
+
+      case 'fs_trash_list':
+        return store.listTrash({ limit: a.limit });
+
+      case 'fs_restore':
+        return store.restore(a.trashId, {
+          to: a.to || null,
+          overwrite: a.overwrite === true,
+          agentId: agent.id,
+          ip: agent.ip
+        });
+
+      case 'fs_empty_trash':
+        return store.emptyTrash({
+          olderThanDays: a.olderThanDays,
+          all: a.all === true,
+          agentId: agent.id,
           ip: agent.ip
         });
 

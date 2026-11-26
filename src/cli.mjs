@@ -67,6 +67,9 @@ for (let i = 0; i < argv.length; i++) {
     case '--expected':
       flags.expected = next();
       break;
+    case '--to':
+      flags.to = next();
+      break;
     case '-h':
     case '--help':
       flags.help = true;
@@ -153,6 +156,8 @@ Commands:
   append <path>                append content from --file or stdin
   mkdir <path>                 create directory (+ parents)
   rm <path>                    move to trash (-r for directories, --permanent)
+  trash                        list recently deleted items (--max)
+  restore <trashId>            restore from trash (--to <path>, --overwrite)
   mv <from> <to>               move/rename (--overwrite)
   cp <from> <to>               copy (--overwrite)
   search [term]                search names/content (--name, --content, --max)
@@ -461,9 +466,33 @@ async function main() {
       return;
     }
 
+    case 'trash': {
+      const data = await ensureOk(await call(`/v1/trash?limit=${flags.max || 100}`));
+      if (!data) return;
+      if (flags.json) return void console.log(JSON.stringify(data, null, 2));
+      for (const batch of data.batches) {
+        const stamp = (batch.deletedAt || '').slice(0, 19).replace('T', ' ');
+        console.log(`${batch.trashId}  ${stamp}  ${batch.type === 'dir' ? 'd' : '-'} ${String(batch.size).padStart(10)}  ${batch.path}`);
+      }
+      console.log(`\n${data.count} item(s) in trash`);
+      return;
+    }
+
+    case 'restore': {
+      const trashId = rest[0];
+      if (!trashId) return fail('restore <trashId>');
+      const data = await ensureOk(
+        await call('/v1/restore', {
+          method: 'POST',
+          body: { trashId, to: flags.to || null, overwrite: !!flags.overwrite }
+        })
+      );
+      if (data) report(data);
+      return;
+    }
+
     case 'mv':
-    case 'cp': {
-      const [from, to] = rest;
+    case 'cp': {      const [from, to] = rest;
       if (!from || !to) return fail(`${cmd} <from> <to>`);
       const data = await ensureOk(
         await call(`/v1/${cmd === 'mv' ? 'move' : 'copy'}`, {

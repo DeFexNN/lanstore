@@ -9,12 +9,15 @@ function esc(value) {
     .replace(/"/g, '&quot;');
 }
 
-export async function renderDashboard({ store, cfg, audit, uploads, req, agent }) {
+export async function renderDashboard({ store, cfg, audit, uploads, req, url = null, agent }) {
   const baseUrl = cfg.publicUrl || `http://${headerValue(req, 'host') || `127.0.0.1:${cfg.port}`}`;
-  const [root, disk, activity] = await Promise.all([
+  const linkToken = url?.searchParams.get('token') || '';
+  const tokenQuery = linkToken ? `&token=${encodeURIComponent(linkToken)}` : '';
+  const [root, disk, activity, trash] = await Promise.all([
     store.list('', { max: 300 }).catch(() => ({ entries: [] })),
     store.diskInfo(),
-    audit.tail(25, { onlyWrites: true }).catch(() => [])
+    audit.tail(25, { onlyWrites: true }).catch(() => []),
+    store.listTrash({ limit: 1 }).catch(() => ({ count: 0 }))
   ]);
 
   const projects = root.entries.filter((e) => e.type === 'dir');
@@ -31,7 +34,7 @@ export async function renderDashboard({ store, cfg, audit, uploads, req, agent }
 
   const fileRows = files
     .map(
-      (f) => `<tr><td><a href="/v1/file?path=${encodeURIComponent(f.path)}">${esc(f.name)}</a></td>
+      (f) => `<tr><td><a href="/v1/file?path=${encodeURIComponent(f.path)}${tokenQuery}">${esc(f.name)}</a></td>
       <td>${humanBytes(f.size)}</td><td>${esc(f.mtime.slice(0, 19).replace('T', ' '))}</td></tr>`
     )
     .join('');
@@ -82,6 +85,7 @@ a{color:#7db3ff;text-decoration:none}a:hover{text-decoration:underline}
   <div class="card"><span class="muted">Всього на диску</span><b>${disk ? humanBytes(disk.totalBytes) : '?'}</b></div>
   <div class="card"><span class="muted">Захисне вікно запису</span><b>${cooldown} с</b></div>
   <div class="card"><span class="muted">Активні завантаження</span><b>${activeUploads}</b></div>
+  <div class="card"><span class="muted">У кошику</span><b>${trash.count}</b></div>
   <div class="card"><span class="muted">Авторизація</span><b>${cfg.auth.enabled ? 'увімкнена' : 'вимкнена'}</b></div>
 </div>
 

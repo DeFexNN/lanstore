@@ -121,6 +121,11 @@ test('bridge re-exports hub tools plus local discovery tools', async () => {
   assert.ok(names.includes('fs_read'));
   assert.ok(names.includes('hub_status'));
   assert.ok(names.includes('hub_rediscover'));
+  assert.ok(names.includes('fs_upload_local'));
+  assert.ok(names.includes('fs_download_local'));
+  assert.ok(names.includes('fs_commit_upload'));
+  assert.ok(names.includes('fs_trash_list'));
+  assert.ok(names.includes('fs_restore'));
 });
 
 test('bridge proxies file operations to the hub', async () => {
@@ -158,7 +163,35 @@ test('write guard contract survives the bridge hop', async () => {
   assert.doesNotMatch(toolText(retried), /RECENTLY_MODIFIED/);
 });
 
-test('hub_status reports the discovered hub', async () => {
+test('bridge uploads and downloads local files without base64', async () => {
+  const src = path.join(tmpRoot, 'local-blob.bin');
+  const back = path.join(tmpRoot, 'back-blob.bin');
+  const payload = Buffer.alloc(2 * 1024 * 1024 + 123);
+  for (let i = 0; i < payload.length; i++) payload[i] = i % 251;
+  await fsp.writeFile(src, payload);
+
+  const up = await request('tools/call', {
+    name: 'fs_upload_local',
+    arguments: { localPath: src, remotePath: 'agent-work/blob.bin' }
+  });
+  const upResult = JSON.parse(toolText(up));
+  assert.equal(upResult.ok, true);
+  assert.equal(upResult.bytes, payload.length);
+
+  const dl = await request('tools/call', {
+    name: 'fs_download_local',
+    arguments: { remotePath: 'agent-work/blob.bin', localPath: back }
+  });
+  const dlResult = JSON.parse(toolText(dl));
+  assert.equal(dlResult.ok, true);
+  assert.equal(dlResult.bytes, payload.length);
+
+  const downloaded = await fsp.readFile(back);
+  assert.equal(downloaded.length, payload.length);
+  assert.deepEqual(downloaded, payload);
+});
+
+test('bridge hub_status reports the discovered hub', async () => {
   const res = await request('tools/call', { name: 'hub_status', arguments: {} });
   const status = JSON.parse(toolText(res));
   assert.equal(status.connected, true);

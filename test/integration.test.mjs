@@ -280,6 +280,101 @@ test('move, copy and trash-based delete', async () => {
   assert.equal(gone.status, 404);
 });
 
+test('trash: list, restore, and overwrite-safe undo', async () => {
+  const p = 'undo/report.csv';
+  await req('/v1/mkdir', { method: 'POST', agent: 'agent-a', body: { path: 'undo' } });
+  await req('/v1/write', { method: 'POST', agent: 'agent-a', body: { path: p, content: 'original' } });
+
+  const del = await req(`/v1/delete?path=${encodeURIComponent(p)}`, { method: 'DELETE', agent: 'agent-a' });
+  assert.equal(del.status, 200);
+  const trashId = del.data.trashId;
+  assert.ok(trashId);
+
+  const list = await req('/v1/trash?limit=50');
+  assert.equal(list.status, 200);
+  const batch = list.data.batches.find((b) => b.trashId === trashId);
+  assert.ok(batch, 'deleted item must be listed');
+  assert.equal(batch.path, p);
+  assert.equal(batch.type, 'file');
+  assert.equal(batch.deletedBy, 'agent-a');
+
+  const restored = await req('/v1/restore', { method: 'POST', agent: 'agent-a', body: { trashId } });
+  assert.equal(restored.status, 200);
+  assert.equal(restored.data.action, 'restored');
+  assert.equal(restored.data.to, p);
+
+  const readBack = await req(`/v1/read?path=${encodeURIComponent(p)}`);
+  assert.equal(readBack.data.content, 'original');
+
+  // Delete again, write a new version, then restore over it.
+  const del2 = await req(`/v1/delete?path=${encodeURIComponent(p)}`, { method: 'DELETE', agent: 'agent-a' });
+  assert.equal(del2.status, 200);
+  await req('/v1/write', { method: 'POST', agent: 'agent-a', body: { path: p, content: 'newer' } });
+
+  const refused = await req('/v1/restore', { method: 'POST', agent: 'agent-a', body: { trashId: del2.data.trashId } });
+  assert.equal(refused.status, 409);
+  assert.equal(refused.data.code, 'already_exists');
+
+  const forced = await req('/v1/restore', {
+    method: 'POST',
+    agent: 'agent-a',
+    body: { trashId: del2.data.trashId, overwrite: true }
+  });
+  assert.equal(forced.status, 200);
+  assert.ok(forced.data.overwrittenBatch, 'replaced version must go to trash');
+
+  const finalRead = await req(`/v1/read?path=${encodeURIComponent(p)}`);
+  assert.equal(finalRead.data.content, 'original');
+
+  const afterList = await req('/v1/trash?limit=50');
+  assert.ok(afterList.data.batches.some((b) => b.path === p && b.trashId === forced.data.overwrittenBatch));
+});
+
+test('trash can be emptied by age', async () => {
+  const empty = await req('/v1/trash', { method: 'POST', body: {} });
+  assert.equal(empty.status, 400);
+
+  const ok = await req('/v1/trash', { method: 'POST', body: { all: true } });
+  assert.equal(ok.status, 200);
+  assert.ok(ok.data.removed >= 0);
+});
+
+test('writes are refused when free space is below the safety margin', async () => {
+  const tight = await createHub({
+    argv: ['--config', path.join(tmpRoot, 'none.json')],
+    overrides: {
+      root: path.join(tmpRoot, 'tight-data'),
+      port: 0,
+      host: '127.0.0.1',
+      minFreeBytes: Number.MAX_SAFE_INTEGER,
+      auth: { enabled: false },
+      audit: { enabled: false },
+      discovery: { enabled: false }
+    }
+  });
+  try {
+    const url = `http://127.0.0.1:${tight.cfg.port}`;
+    const res = await fetch(`${url}/v1/write`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: 'full/disk.txt', content: 'x' })
+    });
+    assert.equal(res.status, 507);
+    const data = await res.json();
+    assert.equal(data.code, 'insufficient_storage');
+
+    const upload = await fetch(`${url}/v1/uploads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: 'full/big.bin', totalBytes: 1024 })
+    });
+    assert.equal(upload.status, 507);
+  } finally {
+    await tight.close();
+  }
+});
+
+
 test('MCP: initialize, tools/list, tool call and the conflict contract', async () => {
   const init = await req('/mcp', {
     method: 'POST',

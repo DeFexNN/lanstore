@@ -1,6 +1,6 @@
 {
   "name": "lanstore",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "LAN shared file hub for AI agents: shared project storage, resumable transfers, 60s read-before-write guard, MCP + auto-discovery, one-command install for opencode/Codex/Claude Code/DeepSeek Harness.",

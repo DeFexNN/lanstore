@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 
 /** Directory inside the storage root that belongs to the hub itself. */
 export const INTERNAL_DIR = '.lanstore';
-export const APP_VERSION = '1.1.0';
+export const APP_VERSION = '1.2.0';
 
 const WIN_BAD_CHARS = /[<>:"|?*\u0000-\u001f]/;
 const WIN_DEVICE_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
