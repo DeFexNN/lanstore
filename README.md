@@ -94,6 +94,14 @@ auth:      disabled (LAN open)
 powershell -ExecutionPolicy Bypass -File scripts\open-firewall.ps1 -Port 8787
 ```
 
+Якщо мережевий профіль Windows — **Public** (частий випадок для Ethernet), правило з
+`Private,Domain` не спрацює. Тоді або переведіть мережу в Private (Settings → Network →
+Ethernet → Private network), або додайте профіль явно:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\open-firewall.ps1 -Profile Private,Domain,Public
+```
+
 HTTP-порт обов'язковий. UDP-порт потрібен лише для автопошуку з Linux-агентів; без нього міст
 усе одно знайде хаб скануванням підмережі (повільніше), або можна задати `LANSTORE_URL`.
 
@@ -328,6 +336,35 @@ lanstore --agent agent-pc2 activity
 Конфлікт CLI показує текстом і завершується кодом `2`, тож скрипт може перечитати файл і повторити.
 
 ---
+
+### 3.5 Інший ПК не бачить хаб
+
+Порядок перевірки:
+
+1. Хаб запущений на своєму ПК і в консолі видно `listening: http://0.0.0.0:8787`.
+2. Брандмауер: TCP 8787 і UDP 8788 відкриті для того профілю, до якого належить мережа.
+   Найчастіша причина — Ethernet позначений як `Public`, а правило створене для `Private`.
+3. Обидва ПК в одній підмережі (наприклад `192.168.1.x/24`). Через VPN (Radmin/Tailscale)
+   broadcast зазвичай не проходить — там адресу задають явно.
+4. Перевірка з іншого ПК без установки:
+
+   ```bash
+   curl -s http://192.168.1.103:8787/v1/health
+   ```
+
+   Windows: `Test-NetConnection 192.168.1.103 -Port 8787` (має бути `TcpTestSucceeded : True`).
+5. Діагностика пошуку: `LANSTORE_DEBUG=1 lanstore doctor` — покаже, чи був UDP-відгук,
+   чи спрацював кеш, чи скан.
+6. Якщо автопошук неможливий — закріпіть адресу:
+
+   ```bash
+   LANSTORE_URL=http://192.168.1.103:8787 lanstore doctor
+   ```
+
+   або додайте `LANSTORE_URL` у `environment` MCP-конфігу. IP можна змінювати — достатньо
+   оновити це значення, решта налаштувань не зачіпається.
+7. Якщо на хабі ввімкнена авторизація — без токена буде `401`:
+   `LANSTORE_TOKEN=... --token ...` при встановленні або в `environment`.
 
 ## 4. Великі файли (десятки ГБ)
 
