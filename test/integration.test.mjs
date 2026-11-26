@@ -339,6 +339,43 @@ test('trash can be emptied by age', async () => {
   assert.ok(ok.data.removed >= 0);
 });
 
+test('upload commit conflict resolves on the second commit', async () => {
+  const p = 'askue/raw/commit-conflict.bin';
+  const created = await req('/v1/write', { method: 'POST', agent: 'agent-a', body: { path: p, content: 'old' } });
+  assert.equal(created.status, 200);
+
+  const abs = path.join(dataRoot, 'askue', 'raw', 'commit-conflict.bin');
+  const old = new Date(Date.now() - 120_000);
+  await fsp.utimes(abs, old, old);
+
+  const begin = await req('/v1/uploads', {
+    method: 'POST',
+    agent: 'agent-b',
+    body: { path: p, totalBytes: 3, expectedVersion: created.data.version }
+  });
+  assert.equal(begin.status, 200);
+
+  const id = begin.data.uploadId;
+  const chunk = await req(`/v1/uploads/${id}?offset=0`, { method: 'PUT', agent: 'agent-b', body: Buffer.from('new') });
+  assert.equal(chunk.status, 200);
+
+  // Another agent changes the file between begin and commit.
+  const foreign = await req('/v1/write', { method: 'POST', agent: 'agent-a', body: { path: p, content: 'fresh' } });
+  assert.equal(foreign.status, 200);
+
+  const commit1 = await req(`/v1/uploads/${id}/commit`, { method: 'POST', agent: 'agent-b', body: {} });
+  assert.equal(commit1.status, 409);
+  assert.equal(commit1.data.ok, false);
+  assert.ok(commit1.data.uploadId, 'session must survive a blocked commit');
+
+  const commit2 = await req(`/v1/uploads/${id}/commit`, { method: 'POST', agent: 'agent-b', body: {} });
+  assert.equal(commit2.status, 200);
+  assert.equal(commit2.data.ok, true);
+
+  const dl = await req(`/v1/file?path=${encodeURIComponent(p)}`);
+  assert.equal(dl.buf.toString(), 'new');
+});
+
 test('writes are refused when free space is below the safety margin', async () => {
   const tight = await createHub({
     argv: ['--config', path.join(tmpRoot, 'none.json')],
