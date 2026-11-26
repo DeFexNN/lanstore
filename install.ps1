@@ -14,9 +14,10 @@ if (-not $node) {
   Write-Host 'Node.js 20+ is required: https://nodejs.org/en/download' -ForegroundColor Red
   exit 1
 }
-$major = & $node.Source -p 'Number(process.versions.node.split(".")[0])'
-if ([int]$major -lt 20) {
-  Write-Host "Node.js 20+ is required, found $(& $node.Source -v)" -ForegroundColor Red
+$ver = (& $node.Source -v).Trim()
+$major = [int](($ver.TrimStart('v')).Split('.')[0])
+if ($major -lt 20) {
+  Write-Host "Node.js 20+ is required, found $ver" -ForegroundColor Red
   exit 1
 }
 
