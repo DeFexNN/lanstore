@@ -1,0 +1,36 @@
+{
+  "name": "lanstore",
+  "host": "0.0.0.0",
+  "port": 8787,
+  "root": "./data",
+  "publicUrl": null,
+  "cooldownMs": 60000,
+  "challengeTtlMs": 600000,
+  "guardSameAgent": false,
+  "inlinePreviewBytes": 131072,
+  "maxInlineWriteBytes": 33554432,
+  "listDefaultMax": 1000,
+  "trash": {
+    "enabled": true,
+    "retentionDays": 30
+  },
+  "uploads": {
+    "chunkHint": 8388608,
+    "ttlMs": 604800000
+  },
+  "audit": {
+    "enabled": true
+  },
+  "discovery": {
+    "enabled": true,
+    "port": 8788
+  },
+  "auth": {
+    "enabled": false,
+    "tokens": {
+      "agent-pc2": "REPLACE_WITH_LONG_RANDOM_TOKEN",
+      "agent-pc3": "REPLACE_WITH_ANOTHER_TOKEN"
+    }
+  },
+  "cors": true
+}

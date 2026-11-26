@@ -1,0 +1,20 @@
+{
+  "name": "lanstore",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "LAN shared file hub for AI agents: shared project storage, resumable transfers, 60s read-before-write guard, MCP + auto-discovery, one-command install for opencode/Codex/Claude Code/DeepSeek Harness.",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "lanstore": "src/cli.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "bridge": "node src/bridge.mjs",
+    "test": "node --test",
+    "cli": "node src/cli.mjs"
+  }
+}
